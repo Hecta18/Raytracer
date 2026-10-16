@@ -7,7 +7,7 @@ textured quad; every pixel is computed on the CPU.
 ```
 zig build --release            # build
 zig build run --release        # run
-zig build test                 # 32 unit tests, no graphics context needed
+zig build test                 # 34 unit tests, no graphics context needed
 zig build run --release -- --selftest   # headless render + statistics
 zig build run --release -- --frames 600 --screenshot out.ppm
 ```
@@ -24,7 +24,13 @@ zig build run --release -- --frames 600 --screenshot out.ppm
 | `space` | Auto-rotate turntable |
 | `r` | Reset the camera |
 | `h` | Toggle the HUD |
+| `l` | Show the light fixture itself (see below) |
 | `esc` | Quit |
+
+Command line: `--selftest` renders headlessly, `--view yaw,pitch,distance` sets a
+reproducible camera, `--screenshot out.ppm` saves the window, `--frames N` exits
+after N frames. Passing `--frames` or `--view` also disables input so scripted
+runs are deterministic.
 
 The image refines progressively: while the camera is still it trades resolution
 for responsiveness, and once you stop it keeps accumulating samples up to 96 and
@@ -59,6 +65,15 @@ The `raytracer` module never imports raylib, which is why `zig build test` and
 | Novel light type | penumbra spot light: smoothstep cone falloff (`src/light.zig:48`) plus a finite emitter radius sampled per shadow ray |
 | Coloured translucent / reflective materials | Beer-Lambert absorption per channel (`src/material.zig:40`), coloured metal `F0`, and *tinted* shadow rays through the glass |
 
+## Why the light is hidden by default
+
+A surface already receives the fixture's specular highlight from the direct
+term. Letting reflected rays pick the emitter up as well counts the same
+reflection twice, which made the fixture appear doubled and left bright white
+dots wherever a lucky ray found the small source through the glass. Camera rays
+therefore do not see the fixture at all; rays that pass *through* the glass still
+do, so the internal glow survives. Press `l` to compare.
+
 ## Rendering notes
 
 - **Progressive accumulation.** Each pixel stores a radiance sum *and* its own
@@ -73,8 +88,18 @@ The `raytracer` module never imports raylib, which is why `zig build test` and
   at 640x360 and snapped to whole tiles. Quality adapts at most once every two
   seconds from measured throughput — reacting to every frame makes it thrash,
   because each resize restarts the accumulation.
-- **Tone mapping.** ACES filmic fit plus sRGB gamma; single-sample clamp keeps a
-  lucky refracted ray landing on the emitter from blowing out the average.
+- **Tone mapping.** ACES filmic fit plus sRGB gamma, the gamma part from a
+  4096 entry table: a `pow` per channel per pixel used to cost more on the main
+  thread than the entire trace. The resolve is throttled to ~30 Hz while the
+  image changes and always runs once the image converges.
+- **Fireflies.** Beyond the per-sample clamp, a sample far brighter than what a
+  pixel has already gathered is pulled down to a multiple of its running mean,
+  so an unlucky ray through the emitter stops looking like a white dot instead
+  of slowly fading over a hundred frames.
+- **Bounce budget.** Rays that miss the cluster dominate (they outnumber hits
+  several times over), so `Scene.intersect` hoists the reciprocal direction out
+  of the loop and rejects against the union box first: 96 ns -> 36 ns per miss
+  ray in a micro-benchmark.
 
 ## Deliberate approximations
 
@@ -92,19 +117,26 @@ Measured on 8 hardware threads, ReleaseFast:
 
 | Resolution | ms/frame | throughput |
 |---|---|---|
-| 320x180 | ~2.5 | ~18 Mray/s |
-| 480x270 | ~7.5 | ~18 Mray/s |
+| 320x180 | ~2.9 | ~19 Mray/s |
+| 480x270 | ~7.1 | ~19 Mray/s |
 | 640x360 | ~13 | ~18 Mray/s |
 | 1280x720 | ~49 | ~19 Mray/s |
+
+A fixed 128 sample pass at 320x180 went from 459 ms to 368 ms. Absolute numbers
+move by 20-30% depending on what else the machine is running.
 
 Peak memory is about 8 MB at 640x360 (two RGBA32F accumulation buffers plus the
 resolved RGBA8 image), so the project fits comfortably in a small RAM budget.
 
 ## Testing
 
-`zig build test` runs 32 tests covering the slab test (including rays that start
+`zig build test` runs 34 tests covering the slab test (including rays that start
 inside a box and rays pointing away from it), Fresnel and its material wiring,
 Beer-Lambert ordering, Snell's law including total internal reflection, the GGX
 lobe and its sampler, light cone falloff, the cube layout and its adjacency, and
 end-to-end renders (lit and coloured, identical output with 1 and 4 workers,
 camera resets restarting the accumulation, and resizing).
+
+Two of them are regressions worth naming: a camera change must not leave the
+previous pose in the buffer being refilled (it used to blend two viewpoints into
+one ghosted image), and the fixture must stay invisible until it is toggled on.
