@@ -29,7 +29,11 @@ pub const Cube = struct {
 };
 
 pub fn intersect(cube: Cube, ray: Ray, t_limit: f32) ?Hit {
-    const t = cube.bounds.intersect(ray, t_limit) orelse return null;
+    return intersectInv(cube, ray, math.reciprocal(ray.dir), t_limit);
+}
+
+pub fn intersectInv(cube: Cube, ray: Ray, inv_dir: Vec3, t_limit: f32) ?Hit {
+    const t = cube.bounds.intersectInv(ray.origin, inv_dir, t_limit) orelse return null;
     const point = ray.origin + math.scale(ray.dir, t);
 
     // The face is whichever of the six is closest to the hit point, so exactly
