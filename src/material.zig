@@ -169,10 +169,10 @@ fn valueNoise(p: math.Vec3) f32 {
     return result;
 }
 
+/// Two octaves is enough to break up a flat surface; a third was pure cost.
 fn octaves(p: math.Vec3) f32 {
-    return 0.6 * valueNoise(p) +
-        0.3 * valueNoise(math.scale(p, 2.1) + @as(Vec3, @splat(7.3))) +
-        0.1 * valueNoise(math.scale(p, 4.3) + @as(Vec3, @splat(19.1)));
+    return 0.7 * valueNoise(p) +
+        0.3 * valueNoise(math.scale(p, 2.1) + @as(Vec3, @splat(7.3)));
 }
 
 const shade = Vec3{ 0.85, 0.85, 0.85 };
