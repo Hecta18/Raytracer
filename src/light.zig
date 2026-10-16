@@ -73,6 +73,10 @@ pub const SpotLight = struct {
         const distance = math.dot(self.position - ray.origin, cone_axis) / denominator;
         if (distance <= 0.0) return @splat(0.0);
 
+        // Only the lit face emits, so a ray that reaches the disk from behind
+        // the fixture gets nothing.
+        if (-denominator <= 0.0) return @splat(0.0);
+
         // Soft radial profile instead of a hard disk edge: a bigger apparent
         // source means far less variance in the refracted highlights.
         const on_disk = ray.origin + math.scale(ray.dir, distance);
