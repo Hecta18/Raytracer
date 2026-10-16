@@ -132,3 +132,110 @@ pub const Scene = struct {
         return transmittance;
     }
 };
+const testing = std.testing;
+const std = @import("std");
+
+test "the cluster is a centre cube plus one per face, touching" {
+    const s = Scene.init();
+    try testing.expectEqual(@as(usize, cube_count), s.cubes.len);
+
+    for (s.cubes) |cube| {
+        // Every cube is a unit cube.
+        try testing.expectApproxEqAbs(1.0, cube.bounds.max[0] - cube.bounds.min[0], 1e-6);
+        try testing.expectApproxEqAbs(1.0, cube.bounds.max[1] - cube.bounds.min[1], 1e-6);
+        try testing.expectApproxEqAbs(1.0, cube.bounds.max[2] - cube.bounds.min[2], 1e-6);
+    }
+
+    // Each neighbour shares a face with the centre cube, so their separation
+    // along that axis is exactly zero.
+    const centre = s.cubes[0].bounds;
+    for (s.cubes[1..]) |cube| {
+        const separation: Vec3 = @max(
+            @as(Vec3, @splat(0.0)),
+            @max(centre.min - cube.bounds.max, cube.bounds.min - centre.max),
+        );
+        try testing.expectApproxEqAbs(0.0, math.length(separation), 1e-6);
+
+        // And it sits exactly one unit away along a single axis.
+        const offset = math.scale(cube.bounds.min + cube.bounds.max, 0.5);
+        var along_one_axis = false;
+        inline for (0..3) |axis| {
+            if (@abs(offset[axis]) > 0.5) {
+                try testing.expectApproxEqAbs(1.0, @abs(offset[axis]), 1e-6);
+                along_one_axis = true;
+            }
+        }
+        try testing.expect(along_one_axis);
+    }
+
+    // Two neighbours per axis: one on each side.
+    var per_axis = [_]u32{0} ** 3;
+    for (s.cubes[1..]) |cube| {
+        const offset = math.scale(cube.bounds.min + cube.bounds.max, 0.5);
+        var on_axis = false;
+        inline for (0..3) |axis| {
+            if (@abs(offset[axis]) > 0.5) {
+                try testing.expectApproxEqAbs(1.0, @abs(offset[axis]), 1e-6);
+                per_axis[axis] += 1;
+                on_axis = true;
+            }
+        }
+        try testing.expect(on_axis);
+    }
+    for (per_axis) |count| try testing.expectEqual(@as(u32, 2), count);
+}
+
+test "the palette maps onto the cluster with five materials" {
+    const s = Scene.init();
+    try testing.expectEqual(material.material_count, Scene.materials.len);
+
+    var used = [_]bool{false} ** material.material_count;
+    for (s.cubes) |cube| try testing.expect(cube.mat_id < used.len);
+    for (s.cubes) |cube| used[cube.mat_id] = true;
+
+    var distinct: usize = 0;
+    for (used) |is_used| distinct += @intFromBool(is_used);
+    try testing.expectEqual(@as(usize, 5), distinct);
+}
+
+test "opaque cubes block shadow rays, glass tints them" {
+    const s = Scene.init();
+
+    // Straight down onto the top face of the rose gold cube (metallic, opaque).
+    const metal_top = geometry.intersect(s.cubes[rose_gold], .{
+        .origin = .{ 0, 5, 0 },
+        .dir = .{ 0, -1, 0 },
+    }, math.inf).?;
+
+    // Shooting at the metal cube itself blocks completely.
+    const blocked = s.shadowTransmittance(.{
+        .origin = metal_top.point + @as(Vec3, @splat(0.01)),
+        .dir = .{ 0, -1, 0 },
+    }, 1.0);
+    try testing.expect(math.maxComponent(blocked) == 0.0);
+
+    // A ray that leaves the cluster without crossing anything is fully lit.
+    const open = s.shadowTransmittance(.{
+        .origin = .{ 0, 4, 0 },
+        .dir = .{ 0, 1, 0 },
+    }, 5.0);
+    try testing.expectApproxEqAbs(1.0, math.maxComponent(open), 1e-5);
+}
+
+test "background is black away from the emitter" {
+    const s = Scene.init();
+    const sky = s.background(.{ .origin = .{ 0, 0, 6 }, .dir = .{ 0, 0, 1 } });
+    try testing.expect(math.maxComponent(sky) == 0.0);
+}
+
+test "camera rays point at the target and eql detects movement" {
+    const camera = Camera{};
+    const ray = camera.ray(.{ 0, 0 });
+    const to_target = math.normalize(camera.target - camera.position());
+    try testing.expectApproxEqAbs(1.0, math.dot(ray.dir, to_target), 1e-5);
+
+    var moved = camera;
+    moved.yaw += 0.1;
+    try testing.expect(!Camera.eql(camera, moved));
+    try testing.expect(Camera.eql(camera, camera));
+}
