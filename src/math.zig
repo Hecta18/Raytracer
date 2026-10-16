@@ -16,6 +16,10 @@ pub const Ray = struct {
 
 /// Zig 0.16 no longer broadcasts a scalar into a vector implicitly, and the old
 /// `v.*scalar` syntax is gone too, so component-wise scaling gets a name.
+pub inline fn reciprocal(direction: Vec3) Vec3 {
+    return @as(Vec3, @splat(1.0)) / direction;
+}
+
 pub inline fn scale(vector: Vec3, scalar: f32) Vec3 {
     return vector * @as(Vec3, @splat(scalar));
 }
@@ -83,27 +87,34 @@ pub const Aabb = struct {
         return .{ .min = center - half, .max = center + half };
     }
 
-    /// Slab test: clip the ray against the three pairs of parallel planes that
-    /// make up the box. A ray that starts inside has no entry point, so the exit
-    /// is returned instead; that case matters because rays travel through glass.
-    pub fn intersect(self: Aabb, ray: Ray, t_limit: f32) ?f32 {
+    /// Slab test with the reciprocal direction supplied by the caller. Almost
+    /// every ray in the scene misses, and dividing three times per box was the
+    /// single most expensive thing in the tracer, so the division is hoisted
+    /// out to once per ray.
+    pub fn intersectInv(self: Aabb, origin: Vec3, inv_dir: Vec3, t_limit: f32) ?f32 {
         var t_enter: f32 = -inf;
         var t_exit: f32 = t_limit;
 
         inline for (0..3) |axis| {
-            const inv = 1.0 / ray.dir[axis];
-            var t0 = (self.min[axis] - ray.origin[axis]) * inv;
-            var t1 = (self.max[axis] - ray.origin[axis]) * inv;
-            if (t0 > t1) std.mem.swap(f32, &t0, &t1);
-            t_enter = @max(t_enter, t0);
-            t_exit = @min(t_exit, t1);
+            const t0 = (self.min[axis] - origin[axis]) * inv_dir[axis];
+            const t1 = (self.max[axis] - origin[axis]) * inv_dir[axis];
+            t_enter = @max(t_enter, @min(t0, t1));
+            t_exit = @min(t_exit, @max(t0, t1));
             if (t_exit < t_enter) return null;
         }
+
         // A ray that starts inside has no entry point and leaves at t_exit;
         // either way the hit has to be in front of the origin.
         const t = if (t_enter > 0.0) t_enter else t_exit;
         if (t < 0.0) return null;
         return t;
+    }
+
+    /// Slab test: clip the ray against the three pairs of parallel planes that
+    /// make up the box. A ray that starts inside has no entry point, so the exit
+    /// is returned instead; that case matters because rays travel through glass.
+    pub fn intersect(self: Aabb, ray: Ray, t_limit: f32) ?f32 {
+        return self.intersectInv(ray.origin, reciprocal(ray.dir), t_limit);
     }
 };
 
