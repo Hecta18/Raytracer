@@ -23,8 +23,15 @@ const max_pixels: usize = 640 * 360;
 /// Rendering budget per display frame: short while the camera moves so input
 /// stays responsive, longer while a still image refines.
 const move_budget_ms: u32 = 3;
-const refine_budget_ms: u32 = 8;
+/// While nothing is being interacted with the workers may use the machine
+/// freely: a still image converges several times faster than it did when this
+/// was capped at the frame time.
+const refine_budget_ms: u32 = 100;
 const help_budget_ns: i64 = 6 * std.time.ns_per_ms;
+
+/// Tonemap and upload at most this often while the image is changing. Resolving
+/// every completed sample spent more main thread time than the tracer did.
+const upload_interval_ns: i64 = 33 * std.time.ns_per_ms;
 
 /// A refined sample slower or faster than this says the resolution is wrong.
 const slow_sample_ms: f64 = 60.0;
@@ -42,6 +49,9 @@ const Ui = struct {
     auto_rotate: bool = false,
     show_hud: bool = true,
     quality: f32 = 0.55,
+    /// Show the light fixture itself. Off by default: reflected rays would pick
+    /// it up on top of the specular highlight already added by the direct term.
+    light_visible: bool = false,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -51,6 +61,8 @@ pub fn main(init: std.process.Init) !void {
     var selftest = false;
     var frame_limit: ?u32 = null;
     var screenshot: ?[]const u8 = null;
+    var scripted = false;
+    var ui_camera = rt.scene.Camera{};
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--selftest")) {
@@ -58,6 +70,15 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--frames") and i + 1 < args.len) {
             i += 1;
             frame_limit = try std.fmt.parseInt(u32, args[i], 10);
+            scripted = true;
+        } else if (std.mem.eql(u8, args[i], "--view") and i + 1 < args.len) {
+            // Reproducible camera for screenshots and bug reports.
+            i += 1;
+            var iter = std.mem.splitScalar(u8, args[i], ',');
+            ui_camera.yaw = std.fmt.parseFloat(f32, iter.next() orelse "0") catch 0;
+            ui_camera.pitch = std.fmt.parseFloat(f32, iter.next() orelse "0.3") catch 0.3;
+            ui_camera.distance = std.fmt.parseFloat(f32, iter.next() orelse "5.9") catch 5.9;
+            scripted = true;
         } else if (std.mem.eql(u8, args[i], "--screenshot") and i + 1 < args.len) {
             i += 1;
             screenshot = args[i];
@@ -76,7 +97,7 @@ pub fn main(init: std.process.Init) !void {
     rl.setTargetFPS(60);
 
     var scene = rt.scene.Scene.init();
-    var ui = Ui{};
+    var ui = Ui{ .camera = ui_camera };
 
     var size = renderSize(rl.getScreenWidth(), rl.getScreenHeight(), ui.quality);
     const tile: usize = 32;
@@ -95,8 +116,11 @@ pub fn main(init: std.process.Init) !void {
         rl.getScreenWidth(), rl.getScreenHeight(), size.width, size.height, renderer.workerCount(),
     });
 
+    renderer.setLightVisible(ui.light_visible);
+
     var rng = math.Rng.init(0x853c49e6748fea9b);
     var uploaded: u32 = 0;
+    var last_upload = math.nowNanos();
     var samples_at_reset: u32 = 0;
     var last_sample = math.nowNanos();
     var last_adjust = math.nowNanos();
@@ -109,9 +133,8 @@ pub fn main(init: std.process.Init) !void {
             if (frames >= limit) break;
         }
 
-        // Scripted runs (--frames) ignore input so screenshots and benchmarks
-        // are reproducible.
-        if (frame_limit == null) updateInput(&ui);
+        // Scripted runs ignore input so screenshots and benchmarks reproduce.
+        if (!scripted) updateInput(&ui);
         if (ui.auto_rotate) {
             // Turntable in steps: rotating every frame would reset the
             // accumulation every frame, so each step is allowed to settle first.
@@ -140,6 +163,7 @@ pub fn main(init: std.process.Init) !void {
         // camera keeps refining the image sample by sample. While refining the
         // renderer gets a larger slice of the frame, because no interaction is
         // happening and the budget is otherwise just wasted waiting.
+        if (ui.light_visible != renderer.isLightVisible()) renderer.setLightVisible(ui.light_visible);
         if (renderer.setCamera(ui.camera)) samples_at_reset = 0;
         const refining = renderer.samples() > 0;
         renderer.setFrameBudget(@intCast(if (refining) refine_budget_ms else move_budget_ms));
@@ -150,10 +174,16 @@ pub fn main(init: std.process.Init) !void {
         }
 
         const samples = renderer.samples();
-        if (samples > 0 and samples != uploaded) {
-            const now = math.nowNanos();
+        const now = math.nowNanos();
+        // A restarted accumulation (camera moved, window resized) has to be
+        // shown straight away; otherwise throttle, but never drop the final
+        // frame of a converged image.
+        const restarted = samples < uploaded;
+        const due = restarted or renderer.converged() or now - last_upload >= upload_interval_ns;
+        if (samples > 0 and samples != uploaded and due) {
             rl.updateTexture(target.texture, @ptrCast(renderer.resolve().ptr));
             uploaded = samples;
+            last_upload = now;
 
             // Measure the time a whole sample took and only act on a verdict
             // from the steady state: the first sample after a reset is always
@@ -202,6 +232,7 @@ fn updateInput(ui: *Ui) void {
         ui.camera = .{};
         ui.auto_rotate = false;
     }
+    if (rl.isKeyPressed(.l)) ui.light_visible = !ui.light_visible;
 }
 
 const Size = struct { width: usize, height: usize };
@@ -249,7 +280,7 @@ fn drawHud(renderer: *const Renderer, size: Size) void {
     var line: [128]u8 = undefined;
     var y: i32 = 14;
 
-    rl.drawRectangle(8, 8, 292, 106, .{ .r = 0, .g = 0, .b = 0, .a = 140 });
+    rl.drawRectangle(8, 8, 300, 106, .{ .r = 0, .g = 0, .b = 0, .a = 140 });
 
     y += drawLine("diorama  -  hand rolled raytracer", 18, y, 16, rl.Color.init(235, 235, 235, 255));
     const stats = tryLine(&line, "{d} fps   {d}/{d} spp   {d}x{d}   {d} workers", .{
@@ -262,7 +293,7 @@ fn drawHud(renderer: *const Renderer, size: Size) void {
     });
     y += drawLine(stats, 18, y, 16, rl.Color.init(255, 214, 120, 255));
     y += drawLine("drag: rotate   wheel: zoom", 18, y, 16, rl.Color.init(180, 190, 200, 255));
-    y += drawLine("space: auto rotate   r: reset   h: hud", 18, y, 16, rl.Color.init(180, 190, 200, 255));
+    y += drawLine("space: turntable   r: reset   h: hud   l: light", 18, y, 16, rl.Color.init(180, 190, 200, 255));
     y += drawLine(if (renderer.converged()) "refined: image fully converged" else "refining: image still accumulating", 18, y, 16, rl.Color.init(150, 210, 160, 255));
 
     // Material legend, drawn straight from the palette so it can never drift
