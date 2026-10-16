@@ -83,3 +83,50 @@ fn faceUv(point: Vec3, bounds: Aabb, comptime u_axis: usize, comptime v_axis: us
         (point[v_axis] - bounds.min[v_axis]) / size_v,
     };
 }
+
+const std = @import("std");
+const testing = std.testing;
+const inf = math.inf;
+
+test "cube reports the face it was entered through" {
+    const cube = Cube.centered(.{ 0, 0, 0 }, 1.0, 0);
+
+    const from_left = intersect(cube, .{ .origin = .{ -3, 0, 0 }, .dir = .{ 1, 0, 0 } }, inf).?;
+    try testing.expectEqual(@as(usize, 0), faceAxis(from_left.normal));
+    try testing.expectApproxEqAbs(-1.0, from_left.normal[0], 1e-5);
+    try testing.expect(from_left.front_face);
+
+    const from_above = intersect(cube, .{ .origin = .{ 0, 4, 0 }, .dir = .{ 0, -1, 0 } }, inf).?;
+    try testing.expectApproxEqAbs(1.0, from_above.normal[1], 1e-5);
+    try testing.expectApproxEqAbs(3.5, from_above.t, 1e-4);
+}
+
+test "a ray starting inside exits through the far face" {
+    const cube = Cube.centered(.{ 0, 0, 0 }, 1.0, 0);
+    const hit = intersect(cube, .{ .origin = .{ 0, 0, 0 }, .dir = .{ 0, 0, 1 } }, inf).?;
+    try testing.expect(!hit.front_face);
+    // The normal is flipped to face the incoming ray.
+    try testing.expectApproxEqAbs(-1.0, hit.normal[2], 1e-5);
+    try testing.expectApproxEqAbs(0.5, hit.t, 1e-4);
+}
+
+test "face uv spans zero to one across a face" {
+    const cube = Cube.centered(.{ 0, 0, 0 }, 2.0, 0);
+    const centre = intersect(cube, .{ .origin = .{ -4, 0, 0 }, .dir = .{ 1, 0, 0 } }, inf).?;
+    try testing.expectApproxEqAbs(0.5, centre.uv[0], 1e-5);
+    try testing.expectApproxEqAbs(0.5, centre.uv[1], 1e-5);
+}
+
+test "rays that miss the box return null" {
+    const cube = Cube.centered(.{ 0, 0, 0 }, 1.0, 0);
+    try testing.expect(intersect(cube, .{ .origin = .{ -3, 5, 0 }, .dir = .{ 1, 0, 0 } }, inf) == null);
+}
+
+/// Index of the non-zero component, i.e. the face axis.
+fn faceAxis(normal: Vec3) usize {
+    var axis: usize = 0;
+    inline for (0..3) |i| {
+        if (@abs(normal[i]) > 0.5) axis = i;
+    }
+    return axis;
+}
