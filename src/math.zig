@@ -84,23 +84,26 @@ pub const Aabb = struct {
     }
 
     /// Slab test: clip the ray against the three pairs of parallel planes that
-    /// make up the box. t_min tracks the entry parameter and t_max the exit
-    /// parameter; a swap per axis lets the same code handle rays that start
-    /// inside the box, which matters for rays travelling through glass.
+    /// make up the box. A ray that starts inside has no entry point, so the exit
+    /// is returned instead; that case matters because rays travel through glass.
     pub fn intersect(self: Aabb, ray: Ray, t_limit: f32) ?f32 {
-        var t_min: f32 = 0.0;
-        var t_max: f32 = t_limit;
+        var t_enter: f32 = -inf;
+        var t_exit: f32 = t_limit;
 
         inline for (0..3) |axis| {
             const inv = 1.0 / ray.dir[axis];
             var t0 = (self.min[axis] - ray.origin[axis]) * inv;
             var t1 = (self.max[axis] - ray.origin[axis]) * inv;
             if (t0 > t1) std.mem.swap(f32, &t0, &t1);
-            t_min = @max(t_min, t0);
-            t_max = @min(t_max, t1);
-            if (t_max < t_min) return null;
+            t_enter = @max(t_enter, t0);
+            t_exit = @min(t_exit, t1);
+            if (t_exit < t_enter) return null;
         }
-        return t_min;
+        // A ray that starts inside has no entry point and leaves at t_exit;
+        // either way the hit has to be in front of the origin.
+        const t = if (t_enter > 0.0) t_enter else t_exit;
+        if (t < 0.0) return null;
+        return t;
     }
 };
 
@@ -168,4 +171,72 @@ pub fn sleepMicros(microseconds: u32) void {
         .nsec = @intCast((microseconds % std.time.us_per_s) * std.time.ns_per_us),
     };
     _ = std.c.nanosleep(&request, null);
+}
+const testing = std.testing;
+
+fn expectApprox(expected: f32, actual: f32, tolerance: f32) !void {
+    try testing.expectApproxEqAbs(expected, actual, tolerance);
+}
+
+test "AABB hits from outside, inside and from behind" {
+    const box = Aabb.centered(.{ 0, 0, 0 }, 1.0);
+
+    const hit = box.intersect(.{ .origin = .{ -4, 0, 0 }, .dir = .{ 1, 0, 0 } }, inf).?;
+    try expectApprox(3.0, hit, 1e-4);
+
+    // Starting inside must report the exit, not the origin.
+    const inside = box.intersect(.{ .origin = .{ 0, 0, 0 }, .dir = .{ 1, 0, 0 } }, inf).?;
+    try expectApprox(1.0, inside, 1e-4);
+
+    try testing.expect(box.intersect(.{ .origin = .{ -4, 3, 0 }, .dir = .{ 1, 0, 0 } }, inf) == null);
+}
+
+test "reflect and normalize" {
+    const n: Vec3 = .{ 0, 1, 0 };
+    // Mirroring about y flips the vertical component and keeps the tangent one.
+    const bounced = reflect(.{ 1, -1, 0 }, n);
+    try expectApprox(1.0, bounced[0], 1e-5);
+    try expectApprox(1.0, bounced[1], 1e-5);
+    try expectApprox(1.0, length(normalize(.{ 3, 4, 0 })), 1e-6);
+    try expectApprox(25.0, dot(.{ 3, 4, 0 }, .{ 3, 4, 0 }), 1e-5);
+}
+
+test "clamp and smoothstep" {
+    try expectApprox(1.0, saturate(2.0), 1e-6);
+    try expectApprox(0.0, saturate(-2.0), 1e-6);
+    try expectApprox(0.5, smoothstep(0.0, 1.0, 0.5), 1e-6);
+    try expectApprox(0.0, smoothstep(0.0, 1.0, -1.0), 1e-6);
+    try expectApprox(1.0, smoothstep(0.0, 1.0, 2.0), 1e-6);
+}
+
+test "Rng stays in range and varies" {
+    var rng = Rng.init(42);
+    var sum: f64 = 0;
+    var buckets = [_]u32{0} ** 4;
+    for (0..20_000) |_| {
+        const value = rng.float();
+        try testing.expect(value >= 0.0 and value < 1.0);
+        sum += value;
+        buckets[@intFromFloat(value * 4)] += 1;
+    }
+    // A uniform stream averages 0.5 and fills every quarter of the range.
+    try testing.expectApproxEqAbs(0.5, sum / 20_000, 0.01);
+    for (buckets) |count| try testing.expect(count > 20_000 / 4 * 0.9);
+}
+
+test "halton covers the unit interval" {
+    for (1..500) |index| {
+        const value = halton(@intCast(index), 2);
+        try testing.expect(value >= 0.0 and value < 1.0);
+    }
+    // Radical inverses: 2 is '10' in base two (0.01) and '2' in base three.
+    try expectApprox(0.25, halton(2, 2), 1e-6);
+    try expectApprox(0.75, halton(3, 2), 1e-6);
+    try expectApprox(2.0 / 3.0, halton(2, 3), 1e-6);
+}
+
+test "nowNanos is monotonic" {
+    const first = nowNanos();
+    const second = nowNanos();
+    try testing.expect(second >= first);
 }
