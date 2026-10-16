@@ -82,3 +82,62 @@ pub const SpotLight = struct {
         return @as(Vec3, @splat(self.radiance() * profile * profile));
     }
 };
+const testing = std.testing;
+
+test "cone falloff is smooth and bounded by the cone angles" {
+    const lamp = SpotLight.init(.{ 0, 4, 0 }, .{ 0, 0, 0 }, 0.5, 10.0, 40.0, 100.0);
+
+    const on_axis = lamp.attenuation(.{ 0, 0, 0 });
+    const inside_inner = lamp.attenuation(.{ 0.3, 0, 0 });
+    const outside_cone = lamp.attenuation(.{ 4, 0, 0 });
+
+    try testing.expect(on_axis > 0.0);
+    // Inside the inner angle the falloff is flat: that is what keeps the hot
+    // centre of a real spot clean.
+    try testing.expectApproxEqAbs(on_axis, inside_inner, on_axis * 0.02);
+    try testing.expect(outside_cone == 0.0);
+
+    // Penumbra: inside the cone but past the inner angle the light fades
+    // instead of cutting off.
+    const edge = math.normalize(.{ 1, -4, 0 });
+    const penumbra = lamp.attenuation(math.scale(edge, 4.0));
+    try testing.expect(penumbra > 0.0 and penumbra < on_axis);
+}
+
+test "inverse square falloff" {
+    const lamp = SpotLight.init(.{ 0, 10, 0 }, .{ 0, 0, 0 }, 0.5, 10.0, 80.0, 100.0);
+    const near = lamp.attenuation(.{ 0, 5, 0 });
+    const far = lamp.attenuation(.{ 0, 0, 0 });
+    try testing.expectApproxEqAbs(near / 4.0, far, far * 0.02);
+}
+
+test "emitter samples stay on the disk and rays can hit it" {
+    const lamp = SpotLight.init(.{ 0, 5, 0 }, .{ 0, 0, 0 }, 0.5, 10.0, 80.0, 100.0);
+    var rng = math.Rng.init(3);
+
+    var hits: u32 = 0;
+    for (0..2000) |_| {
+        const point = lamp.sample(&rng);
+        const on_disk = math.length(point - lamp.position);
+        try testing.expect(on_disk <= lamp.radius + 1e-4);
+
+        // Aim a ray from the origin back at that point: it must hit the disk.
+        const ray: math.Ray = .{ .origin = .{ 0, 0, 0 }, .dir = math.normalize(point - @as(Vec3, @splat(0.0))) };
+        if (math.maxComponent(lamp.emission(ray)) > 0.0) hits += 1;
+    }
+    try testing.expect(hits > 1500);
+
+    // A ray pointing away from the light carries nothing.
+    try testing.expect(math.maxComponent(lamp.emission(.{ .origin = .{ 0, 0, 0 }, .dir = .{ 0, 0, -1 } })) == 0.0);
+}
+
+test "radiance and the direct term agree on the emitter strength" {
+    const lamp = SpotLight.init(.{ 0, 5, 0 }, .{ 0, 0, 0 }, 0.75, 20.0, 60.0, 90.0);
+    // intensity / (pi * r^2) is the emitted radiance, and multiplying it back
+    // by the disk area has to return the original intensity.
+    try testing.expectApproxEqAbs(
+        lamp.intensity,
+        lamp.radiance() * math.pi * lamp.radius * lamp.radius,
+        1e-3,
+    );
+}
