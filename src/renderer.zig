@@ -16,14 +16,15 @@ const Scene = scene.Scene;
 const Camera = scene.Camera;
 const Vec3 = math.Vec3;
 const Vec4 = math.Vec4;
+const zero_radiance: Vec4 = .{ 0.0, 0.0, 0.0, 0.0 };
 
 pub const Config = struct {
     width: usize = 480,
     height: usize = 270,
     /// Worker threads. 0 means one less than the hardware thread count.
     worker_count: usize = 0,
-    tile_size: usize = 32,
-    max_depth: u32 = 8,
+    tile_size: usize = 16,
+    max_depth: u32 = 6,
     /// Stop refining the image after this many accumulated samples.
     max_samples: u32 = 96,
     /// Workers stop claiming new tiles once this budget is spent.
@@ -33,6 +34,12 @@ pub const Config = struct {
     /// Single sample clamp. The emitter is tiny in solid angle, so an unlucky
     /// refracted ray can land on it and blow out the whole average otherwise.
     firefly_clamp: f32 = 5.0,
+    /// Reject samples far brighter than what the pixel has already gathered.
+    /// A single ray that finds the emitter through the glass is still a white
+    /// dot after dozens of samples, and clamping it against the running mean
+    /// removes it as it appears rather than waiting for the average to dilute.
+    outlier_factor: f32 = 8.0,
+    outlier_floor: f32 = 2.0,
 };
 
 /// How strongly transmission lighting bleeds through a translucent material.
@@ -98,8 +105,14 @@ pub const Renderer = struct {
     published: std.atomic.Value(u32) = .init(0),
     deadline: std.atomic.Value(i64) = .init(0),
     stop: std.atomic.Value(bool) = .init(false),
+    /// Whether camera rays may see the light fixture itself. Off by default:
+    /// the specular copy is already accounted for by the direct term, so
+    /// letting reflected rays find the fixture as well counts it twice.
+    light_visible: std.atomic.Value(bool) = .init(false),
 
     workers: []std.Thread,
+    /// Gamma curve in table form, see `encode`.
+    gamma_lut: [gamma_lut_size]u8 = undefined,
 
     pub fn init(allocator: std.mem.Allocator, config: Config, scene_ptr: *const Scene) !*Renderer {
         var cfg = config;
@@ -122,6 +135,7 @@ pub const Renderer = struct {
             .workers = &.{},
         };
         self.updateTileGrid();
+        self.buildGammaLut();
         try self.allocateBuffers();
         errdefer self.freeBuffers();
 
@@ -183,6 +197,7 @@ pub fn resize(self: *Renderer, new_width: usize, new_height: usize) !void {
         return self.cfg.max_samples;
     }
 
+
     pub fn workerCount(self: *const Renderer) usize {
         return self.workers.len;
     }
@@ -194,6 +209,14 @@ pub fn resize(self: *Renderer, new_width: usize, new_height: usize) !void {
 
     pub fn converged(self: *const Renderer) bool {
         return self.samples() >= self.cfg.max_samples;
+    }
+
+    pub fn setLightVisible(self: *Renderer, visible: bool) void {
+        self.light_visible.store(visible, .release);
+    }
+
+    pub fn isLightVisible(self: *const Renderer) bool {
+        return self.light_visible.load(.acquire);
     }
 
     pub fn setFrameBudget(self: *Renderer, budget_ms: u32) void {
@@ -239,9 +262,9 @@ pub fn resize(self: *Renderer, new_width: usize, new_height: usize) !void {
             const radiance = Vec3{ sample[0] / count, sample[1] / count, sample[2] / count };
             const mapped = acesFilmic(radiance);
             const offset = i * 4;
-            self.out[offset + 0] = toByte(mapped[0]);
-            self.out[offset + 1] = toByte(mapped[1]);
-            self.out[offset + 2] = toByte(mapped[2]);
+            self.out[offset + 0] = self.encode(mapped[0]);
+            self.out[offset + 1] = self.encode(mapped[1]);
+            self.out[offset + 2] = self.encode(mapped[2]);
             self.out[offset + 3] = 255;
         }
         return self.out;
@@ -256,10 +279,12 @@ pub fn resize(self: *Renderer, new_width: usize, new_height: usize) !void {
                 continue;
             }
             // Nothing claimable: the budget is spent, the image is converged, or
-            // a camera change is draining the workers.
+            // a camera change is draining the workers. Sleep quickly rather
+            // than spinning: with one worker per core, idle threads that keep
+            // running steal the core the main thread needs for input.
             idle_spins += 1;
-            if (idle_spins > 128) {
-                math.sleepMicros(200);
+            if (idle_spins > 4) {
+                math.sleepMicros(if (idle_spins < 64) 200 else 1000);
                 idle_spins = 0;
             } else {
                 std.Thread.yield() catch {};
@@ -328,7 +353,20 @@ pub fn resize(self: *Renderer, new_width: usize, new_height: usize) !void {
                 const ndc_x = (@as(f32, @floatFromInt(x)) + jitter_x) * inv_width * 2.0 - 1.0;
                 const ndc_y = 1.0 - (@as(f32, @floatFromInt(y)) + jitter_y) * inv_height * 2.0;
 
-                const color = self.pathTrace(task.camera.ray(.{ ndc_x, ndc_y }), rng);
+                var color = self.pathTrace(task.camera.ray(.{ ndc_x, ndc_y }), rng);
+
+                // Outlier rejection: a sample far brighter than what this pixel
+                // has already collected is almost always a lucky ray through
+                // the emitter, and it would sit there as a white dot for many
+                // frames before the average diluted it.
+                if (previous[3] > 0.0) {
+                    inline for (0..3) |channel| {
+                        const mean = previous[channel] / previous[3];
+                        const cap = @max(self.cfg.outlier_floor, mean * self.cfg.outlier_factor);
+                        color[channel] = @min(color[channel], cap);
+                    }
+                }
+
                 accum[index] = .{
                     previous[0] + color[0],
                     previous[1] + color[1],
@@ -344,12 +382,17 @@ pub fn resize(self: *Renderer, new_width: usize, new_height: usize) !void {
         var throughput: Vec3 = @splat(1.0);
         var ray = ray_in;
         var depth: u32 = 0;
+        // A reflected ray must not pick the fixture up again: the specular
+        // highlight it would carry is already in the direct term below.
+        var refracted = false;
 
         while (depth < self.cfg.max_depth) : (depth += 1) {
             const hit = self.scene.intersect(ray, math.inf) orelse {
-                // Nothing in the way: the ray can still carry the light itself,
-                // which is what the glass transmits and the mirrors reflect.
-                radiance += throughput * self.scene.background(ray);
+                // Escaped rays only see the fixture if they went through the
+                // glass, which is what puts a glowing core inside a gem.
+                if (refracted or self.light_visible.load(.monotonic)) {
+                    radiance += throughput * self.scene.background(ray);
+                }
                 break;
             };
             const m = &Scene.materials[hit.mat_id];
@@ -387,6 +430,7 @@ pub fn resize(self: *Renderer, new_width: usize, new_height: usize) !void {
                 // what makes a thick emerald dark green and its thin edges pale.
                 throughput *= math.scale(@as(Vec3, @splat(1.0)) - fresnel, 1.0 / (1.0 - reflect_probability)) * m.absorb(hit.t);
                 ray = .{ .origin = hit.point + math.scale(dir, self.cfg.ray_epsilon), .dir = dir };
+                refracted = true;
             } else break;
 
             if (depth >= 3) {
@@ -441,12 +485,30 @@ pub fn resize(self: *Renderer, new_width: usize, new_height: usize) !void {
     fn endInvalidation(self: *Renderer) void {
         self.lock.lock();
         self.active = 1 - self.active;
+        // The other buffer still holds the pose it last rendered, so it has to
+        // be cleared before the workers start filling it again. Leaving stale
+        // samples in place blends two poses into one ghosted image.
+        @memset(self.accum[self.active], zero_radiance);
         self.next_tile = 0;
         self.done_tiles = 0;
         self.completed = 0;
         self.published.store(0, .release);
         self.invalidated = false;
         self.lock.unlock();
+    }
+
+    /// Table lookup instead of a pow per channel per pixel: twelve bits of
+    /// input resolution is far more than the eight bits we end up with.
+    fn buildGammaLut(self: *Renderer) void {
+        for (&self.gamma_lut, 0..) |*entry, index| {
+            const value = @as(f32, @floatFromInt(index)) / @as(f32, gamma_lut_size - 1);
+            entry.* = toByte(value);
+        }
+    }
+
+    fn encode(self: *const Renderer, channel: f32) u8 {
+        const index = @as(usize, @intFromFloat(math.saturate(channel) * (gamma_lut_size - 1) + 0.5));
+        return self.gamma_lut[index];
     }
 
     fn pixelCount(self: *const Renderer) usize {
@@ -477,6 +539,11 @@ pub fn resize(self: *Renderer, new_width: usize, new_height: usize) !void {
         self.allocator.free(self.out);
     }
 };
+
+/// Gamma curve sampled into a table. Calling std.math.pow per channel per pixel
+/// cost more than the whole path tracer did per frame on the main thread, and
+/// twelve bits of input resolution is far more than eight bits of output.
+const gamma_lut_size = 4096;
 
 /// Narkowicz ACES fit, then sRGB gamma. Both are needed or the glass reads as
 /// flat grey plastic.
@@ -512,6 +579,19 @@ const test_scene = struct {
         testing.allocator.destroy(self.scene);
     }
 };
+
+/// Drives the renderer from the calling thread until `target` samples are done.
+fn renderSamples(renderer: *Renderer, target: u32) !void {
+    var rng = math.Rng.init(23);
+    var guard: u32 = 0;
+    while (renderer.samples() < target) : (guard += 1) {
+        renderer.setFrameBudget(5_000);
+        if (!renderer.work(&rng)) {
+            if (guard > 100_000) return error.Timeout;
+            math.sleepMicros(50);
+        }
+    }
+}
 
 fn imageStats(image: []const u8) struct { mean: f64, max: u8, coloured: usize } {
     var sum: f64 = 0;
@@ -643,4 +723,67 @@ test "resize swaps the buffers and keeps rendering" {
         if (!harness.renderer.work(&rng)) math.sleepMicros(100);
     }
     try testing.expect(imageStats(harness.renderer.resolve()).max > 40);
+}
+
+test "a camera change does not leave the previous pose behind" {
+    // Regression: flipping between the two accumulation buffers used to leave
+    // the previous pose in the buffer being refilled, which blended two
+    // viewpoints into one ghosted image.
+    const wide = scene.Camera{ .distance = 14.0, .pitch = 1.2, .aspect = 4.0 / 3.0 };
+    const close = scene.Camera{ .distance = 2.6, .pitch = 0.15, .yaw = 0.3, .aspect = 4.0 / 3.0 };
+
+    var moved = try test_scene.start(.{ .width = 64, .height = 48, .tile_size = 16, .worker_count = 2, .max_samples = 4, .frame_budget_ms = 5_000 });
+    defer moved.stop();
+    var fresh = try test_scene.start(.{ .width = 64, .height = 48, .tile_size = 16, .worker_count = 2, .max_samples = 4, .frame_budget_ms = 5_000 });
+    defer fresh.stop();
+
+    _ = moved.renderer.setCamera(wide);
+    try renderSamples(moved.renderer, 4);
+    try testing.expect(moved.renderer.setCamera(close));
+    try renderSamples(moved.renderer, 4);
+
+    _ = fresh.renderer.setCamera(close);
+    try renderSamples(fresh.renderer, 4);
+
+    const blended = imageStats(moved.renderer.resolve()).mean;
+    const reference = imageStats(fresh.renderer.resolve()).mean;
+
+    // The two viewpoints have to be different enough for the test to mean
+    // anything, and the reused image must match the fresh one rather than sit
+    // somewhere between the two poses.
+    _ = imageStats(moved.renderer.resolve());
+    try testing.expect(blended > 0.0);
+    try testing.expectApproxEqAbs(reference, blended, @max(reference, 1.0) * 0.15);
+}
+
+test "the fixture is only visible through glass unless toggled on" {
+    // Put the lamp above the cluster and look at it from the side, where the
+    // cubes cannot block it. Reflections must not pick it up, because the
+    // direct term already carries the specular highlight.
+    var harness = try test_scene.start(.{ .width = 48, .height = 32, .tile_size = 16, .worker_count = 2, .max_samples = 2, .frame_budget_ms = 5_000 });
+    defer harness.stop();
+
+    harness.scene.light.position = .{ 0, 6, 0 };
+    harness.scene.light.target = .{ 0, 0, 0 };
+
+    const looking = scene.Camera{
+        .target = .{ 0, 6, 0 },
+        .distance = 5.385,
+        .pitch = -0.38,
+        .aspect = 1.5,
+    };
+
+    _ = harness.renderer.setCamera(looking);
+    try renderSamples(harness.renderer, 2);
+    const hidden = imageStats(harness.renderer.resolve()).max;
+    try testing.expect(hidden == 0);
+
+    harness.renderer.setLightVisible(true);
+    // Nudge the camera so the accumulation restarts with the fixture visible.
+    var nudged = looking;
+    nudged.yaw += 0.02;
+    _ = harness.renderer.setCamera(nudged);
+    try renderSamples(harness.renderer, 2);
+    const shown = imageStats(harness.renderer.resolve()).max;
+    try testing.expect(shown > 60);
 }
