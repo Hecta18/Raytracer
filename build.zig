@@ -48,4 +48,12 @@ pub fn build(b: *std.Build) void {
 
     const run_step = b.step("run", "Run the diorama");
     run_step.dependOn(&run_cmd.step);
+
+    // The raytracer module never imports raylib, so its tests link no graphics
+    // stack and run without a display.
+    const module_tests = b.addTest(.{ .root_module = raytracer });
+    // The renderer reads a monotonic clock and sleeps through libc.
+    module_tests.root_module.link_libc = true;
+    const test_step = b.step("test", "Run the raytracer unit tests");
+    test_step.dependOn(&b.addRunArtifact(module_tests).step);
 }
