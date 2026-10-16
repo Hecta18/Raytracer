@@ -58,29 +58,56 @@ pub const Camera = struct {
     }
 };
 
+/// The layout, written once: centre cube plus one per face, each touching its
+/// neighbour exactly, like a Minecraft block cross. The cubes and the cluster
+/// bounding box are both derived from this table so they cannot drift apart.
+const Layout = struct { centre: Vec3, mat_id: u32 };
+
+const layout = [cube_count]Layout{
+    .{ .centre = .{ 0.0, 0.0, 0.0 }, .mat_id = emerald },
+    .{ .centre = .{ cube_size, 0.0, 0.0 }, .mat_id = amber },
+    .{ .centre = .{ -cube_size, 0.0, 0.0 }, .mat_id = sapphire },
+    .{ .centre = .{ 0.0, cube_size, 0.0 }, .mat_id = rose_gold },
+    .{ .centre = .{ 0.0, -cube_size, 0.0 }, .mat_id = obsidian },
+    .{ .centre = .{ 0.0, 0.0, cube_size }, .mat_id = emerald },
+    .{ .centre = .{ 0.0, 0.0, -cube_size }, .mat_id = sapphire },
+};
+
+/// The box that contains the whole cluster.
+fn clusterBounds() math.Aabb {
+    const half: Vec3 = @splat(cube_size * 0.5);
+    var bounds = math.Aabb{
+        .min = math.scale(layout[0].centre, 2.0) - half,
+        .max = math.scale(layout[0].centre, 2.0) + half,
+    };
+    for (layout[1..]) |entry| {
+        bounds.min = @min(bounds.min, entry.centre - half);
+        bounds.max = @max(bounds.max, entry.centre + half);
+    }
+    return bounds;
+}
+
 pub const Scene = struct {
     cubes: [cube_count]geometry.Cube,
+    /// Union of the cluster, so the common case of a ray that misses all seven
+    /// cubes costs one box test instead of seven.
+    bounds: math.Aabb,
     light: light.SpotLight,
 
     pub const materials = material.palette;
 
-    /// Centre cube plus one cube per face, each touching its neighbour exactly,
-    /// like a Minecraft block cross.
     pub fn init() Scene {
+        var cubes: [cube_count]geometry.Cube = undefined;
+        for (layout, 0..) |entry, i| {
+            cubes[i] = geometry.Cube.centered(entry.centre, cube_size, entry.mat_id);
+        }
         return .{
-            .cubes = .{
-                geometry.Cube.centered(.{ 0.0, 0.0, 0.0 }, cube_size, emerald),
-                geometry.Cube.centered(.{ cube_size, 0.0, 0.0 }, cube_size, amber),
-                geometry.Cube.centered(.{ -cube_size, 0.0, 0.0 }, cube_size, sapphire),
-                geometry.Cube.centered(.{ 0.0, cube_size, 0.0 }, cube_size, rose_gold),
-                geometry.Cube.centered(.{ 0.0, -cube_size, 0.0 }, cube_size, obsidian),
-                geometry.Cube.centered(.{ 0.0, 0.0, cube_size }, cube_size, emerald),
-                geometry.Cube.centered(.{ 0.0, 0.0, -cube_size }, cube_size, sapphire),
-            },
+            .cubes = cubes,
+            .bounds = clusterBounds(),
             .light = light.SpotLight.init(
                 .{ 3.2, 4.4, -2.4 },
                 .{ 0.0, 0.0, 0.0 },
-                0.95,
+                2.0,
                 18.0,
                 45.0,
                 250.0,
@@ -89,10 +116,13 @@ pub const Scene = struct {
     }
 
     pub fn intersect(self: *const Scene, ray: math.Ray, t_limit: f32) ?geometry.Hit {
+        const inv_dir = math.reciprocal(ray.dir);
+        if (self.bounds.intersectInv(ray.origin, inv_dir, t_limit) == null) return null;
+
         var closest: ?geometry.Hit = null;
         var limit = t_limit;
         for (self.cubes) |cube| {
-            if (geometry.intersect(cube, ray, limit)) |hit| {
+            if (geometry.intersectInv(cube, ray, inv_dir, limit)) |hit| {
                 closest = hit;
                 limit = hit.t;
             }
