@@ -32,7 +32,7 @@ pub const Config = struct {
     shadow_epsilon: f32 = 3e-3,
     /// Single sample clamp. The emitter is tiny in solid angle, so an unlucky
     /// refracted ray can land on it and blow out the whole average otherwise.
-    firefly_clamp: f32 = 12.0,
+    firefly_clamp: f32 = 5.0,
 };
 
 /// How strongly transmission lighting bleeds through a translucent material.
@@ -177,6 +177,10 @@ pub fn resize(self: *Renderer, new_width: usize, new_height: usize) !void {
 
     pub fn height(self: *const Renderer) usize {
         return self.cfg.height;
+    }
+
+    pub fn maxSamples(self: *const Renderer) u32 {
+        return self.cfg.max_samples;
     }
 
     pub fn workerCount(self: *const Renderer) usize {
@@ -488,4 +492,155 @@ fn acesFilmic(color: Vec3) Vec3 {
 fn toByte(channel: f32) u8 {
     const gamma = std.math.pow(f32, math.saturate(channel), 1.0 / 2.2);
     return @intFromFloat(@min(gamma * 255.0 + 0.5, 255.0));
+}
+const testing = std.testing;
+
+const test_scene = struct {
+    scene: *Scene = undefined,
+    renderer: *Renderer = undefined,
+
+    fn start(config: Config) !@This() {
+        var self = @This(){};
+        self.scene = try testing.allocator.create(Scene);
+        self.scene.* = Scene.init();
+        self.renderer = try Renderer.init(testing.allocator, config, self.scene);
+        return self;
+    }
+
+    fn stop(self: *@This()) void {
+        self.renderer.deinit();
+        testing.allocator.destroy(self.scene);
+    }
+};
+
+fn imageStats(image: []const u8) struct { mean: f64, max: u8, coloured: usize } {
+    var sum: f64 = 0;
+    var brightest: u8 = 0;
+    var coloured: usize = 0;
+    const pixels = image.len / 4;
+    for (0..pixels) |pixel| {
+        sum += image[pixel * 4];
+        brightest = @max(brightest, image[pixel * 4]);
+        const r: i32 = image[pixel * 4];
+        const g: i32 = image[pixel * 4 + 1];
+        const b: i32 = image[pixel * 4 + 2];
+        const hi = @max(r, @max(g, b));
+        const lo = @min(r, @min(g, b));
+        if (hi > 12 and hi - lo > 12) coloured += 1;
+    }
+    return .{ .mean = sum / @as(f64, @floatFromInt(pixels)), .max = brightest, .coloured = coloured };
+}
+
+test "renders a lit, coloured image" {
+    var harness = try test_scene.start(.{
+        .width = 96,
+        .height = 64,
+        .tile_size = 32,
+        .worker_count = 2,
+        .max_samples = 4,
+        .frame_budget_ms = 5_000,
+    });
+    defer harness.stop();
+
+    const aspect = @as(f32, @floatFromInt(harness.renderer.width())) / @as(f32, @floatFromInt(harness.renderer.height()));
+    try testing.expect(harness.renderer.setCamera(scene.Camera{ .aspect = aspect }));
+
+    var rng = math.Rng.init(1);
+    var guard: u32 = 0;
+    while (harness.renderer.samples() < 4) : (guard += 1) {
+        harness.renderer.setFrameBudget(5_000);
+        if (!harness.renderer.work(&rng)) {
+            try testing.expect(guard < 5_000_000);
+            math.sleepMicros(100);
+        }
+    }
+
+    const stats = imageStats(harness.renderer.resolve());
+    // The frame is mostly black background, so judge the mean loosely and the
+    // peak strictly.
+    try testing.expect(stats.max > 40);
+    try testing.expect(stats.mean > 0.2);
+    try testing.expect(stats.coloured > 0);
+}
+
+test "the result does not depend on the number of workers" {
+    var single = try test_scene.start(.{ .width = 64, .height = 48, .tile_size = 16, .worker_count = 1, .max_samples = 2, .frame_budget_ms = 5_000 });
+    defer single.stop();
+    var many = try test_scene.start(.{ .width = 64, .height = 48, .tile_size = 16, .worker_count = 4, .max_samples = 2, .frame_budget_ms = 5_000 });
+    defer many.stop();
+
+    for ([_]*Renderer{ single.renderer, many.renderer }) |renderer| {
+        _ = renderer.setCamera(scene.Camera{ .aspect = 4.0 / 3.0 });
+        var rng = math.Rng.init(5);
+        var guard: u32 = 0;
+        while (renderer.samples() < 2) : (guard += 1) {
+            renderer.setFrameBudget(5_000);
+            if (!renderer.work(&rng)) {
+                try testing.expect(guard < 5_000_000);
+                math.sleepMicros(100);
+            }
+        }
+    }
+
+    const a = single.renderer.resolve();
+    const b = many.renderer.resolve();
+    const stats_a = imageStats(a);
+    const stats_b = imageStats(b);
+    // Same picture, so the luminance has to match closely.
+    try testing.expectApproxEqAbs(stats_a.mean, stats_b.mean, @max(stats_a.mean, 1.0) * 0.35);
+    try testing.expectApproxEqAbs(@as(f64, stats_a.max), @as(f64, stats_b.max), 64.0);
+}
+
+test "moving the camera restarts the accumulation" {
+    var harness = try test_scene.start(.{ .width = 64, .height = 48, .tile_size = 16, .worker_count = 2, .max_samples = 5, .frame_budget_ms = 5_000 });
+    defer harness.stop();
+
+    _ = harness.renderer.setCamera(scene.Camera{ .aspect = 4.0 / 3.0 });
+    var rng = math.Rng.init(9);
+    while (harness.renderer.samples() < 3) {
+        harness.renderer.setFrameBudget(5_000);
+        if (!harness.renderer.work(&rng)) math.sleepMicros(100);
+    }
+    try testing.expectEqual(@as(u32, 3), harness.renderer.samples());
+    // Three of five: still refining, not converged.
+    try testing.expect(!harness.renderer.converged());
+
+    const moved = scene.Camera{ .yaw = 1.2, .aspect = 4.0 / 3.0 };
+    try testing.expect(harness.renderer.setCamera(moved));
+    try testing.expectEqual(@as(u32, 0), harness.renderer.samples());
+
+    // Setting the same camera again is a no-op.
+    try testing.expect(!harness.renderer.setCamera(moved));
+    try testing.expect(harness.renderer.setCamera(scene.Camera{ .yaw = 1.3, .aspect = 4.0 / 3.0 }));
+
+    while (harness.renderer.samples() < 5) {
+        harness.renderer.setFrameBudget(5_000);
+        if (!harness.renderer.work(&rng)) math.sleepMicros(100);
+    }
+    try testing.expect(harness.renderer.converged());
+}
+
+test "resize swaps the buffers and keeps rendering" {
+    var harness = try test_scene.start(.{ .width = 64, .height = 48, .tile_size = 16, .worker_count = 2, .max_samples = 2, .frame_budget_ms = 5_000 });
+    defer harness.stop();
+
+    _ = harness.renderer.setCamera(scene.Camera{ .aspect = 16.0 / 9.0 });
+    var rng = math.Rng.init(11);
+    while (harness.renderer.samples() < 2) {
+        harness.renderer.setFrameBudget(5_000);
+        if (!harness.renderer.work(&rng)) math.sleepMicros(100);
+    }
+
+    try harness.renderer.resize(96, 64);
+    try testing.expectEqual(@as(usize, 96), harness.renderer.width());
+    try testing.expectEqual(@as(usize, 64), harness.renderer.height());
+    try testing.expectEqual(@as(usize, 96 * 64 * 4), harness.renderer.resolve().len);
+
+    // The aspect changed with the buffers, so the camera must be re-applied.
+    _ = harness.renderer.setCamera(scene.Camera{ .aspect = 96.0 / 64.0 });
+    while (harness.renderer.samples() < 2) {
+        harness.renderer.setFrameBudget(5_000);
+        if (!harness.renderer.work(&rng)) math.sleepMicros(100);
+    }
+    try testing.expect(imageStats(harness.renderer.resolve()).max > 40);
 }
