@@ -1,5 +1,7 @@
 # Diorama — a hand-rolled raytracer in Zig + raylib
 
+[VIDEO](https://youtu.be/hT7kZdCJ5XA)
+
 Seven glass cubes in a Minecraft-style cross, lit by a single spot light, rendered
 by a path tracer written from scratch. raylib only opens the window and blits one
 textured quad; every pixel is computed on the CPU.
